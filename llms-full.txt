@@ -1,0 +1,238 @@
+# symbol-mcp
+
+A Model Context Protocol server and CLI that tells an agent how to call something in a codebase: the signature, every parameter or prop with its resolved type, whether it's optional, its default value and its docblock, plus the file and line. It covers TypeScript, JavaScript and PHP, in the project and in installed packages.
+
+This file is the manual for agents that call symbol-mcp's tools. If you're changing the server itself, read the source; this file describes the tool contract, with pointers to the code behind each behavior (§ Source pointers).
+
+## TL;DR {#tldr}
+
+- Four tools: `describe` (how to call one symbol), `list_exports` (what a package, file or namespace offers), `find_usages` (working examples from the project), and `status` (root, engines, what's missing).
+- Call `describe` before using a function, component, class or template you haven't used yet, instead of opening its source or `.d.ts` file. One call replaces reading the declaration, following its imported types, and finding its defaults.
+- Props are flattened: `Omit<BaseProps, "id"> & { … }` comes back as one list of props. Props a component takes from the standard library or `@types` packages are summarized under the type the code wrote, such as `+ 269 more from Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "onChange">`, which means it also accepts every `<a>` attribute except `onChange`.
+- Every custom type the answer mentions by name (`ImageProps`, `TemplateArray`, `LinkData`) is defined once in a `types:` section at the end, closest types first, so one call covers types inside types. TypeScript's standard library types (`HTMLElement`, `Promise`) and React's own types (`ReactNode`, `CSSProperties`, `RefAttributes`) are left as names, since agents know them.
+- Defaults come from the code (`{ size = "md" }`, `$args['size'] ?? 'md'`, `array_merge` with a defaults array) and from docblocks ("Default 'md'."). For packages whose `.d.ts` dropped them, they're read from the package's original source through its source maps.
+- An answer that didn't fully resolve ends with `resolution: partial` and the reasons. Don't treat a partial answer's `any` types as the real types. A fully resolved answer has no resolution block; a `notes:` block appears only when something limits the answer.
+- The project root is found automatically (§ Root). `status` shows which root is in use and how it was chosen.
+- PHP doesn't need to be installed, and the project doesn't need TypeScript.
+
+## Command index {#command-index}
+
+| Tool | Purpose | Notes |
+|---|---|---|
+| `describe` | Signature, parameters or props, defaults, docblock and location of a symbol | (contract) name forms, lookup order, output format |
+| `list_exports` | Every export of a module, package, file or PHP namespace, with short signatures | Pick something here, then `describe` it |
+| `find_usages` | Where the project calls or renders a symbol, with the whole call or JSX element | TypeScript matches the exact symbol; PHP matches by name |
+| `status` | Root and how it was chosen, engines, indexed file counts, missing pieces | First thing to check when an answer looks wrong |
+
+All four take `root` (one call only) and `format` (`text`, the default, or `json` for the full structure).
+
+## `describe` {#describe}
+
+| arg | type | meaning |
+|---|---|---|
+| `name` | string | The symbol. See § Name forms. |
+| `from` | string | Narrow the lookup: a file path relative to the root, a module specifier (`@scope/pkg`, `./lib/api`), or a PHP namespace. |
+| `language` | string | `typescript`, `ts`, `tsx`, `javascript`, `js`, `jsx` or `php`. JavaScript and TypeScript share one adapter. Any other value is an error. |
+| `depth` | integer 0-10 | How many hops of custom types to define under `types:`. Default: all, within the size budget (§ Reading the text output). 1 defines only the types the parameters use directly, 2 also the types those types use. 0 shows parameter types only, with no fields and no `types:` section. |
+| `root` | string | Project root for this call. Usually leave it out. |
+| `format` | `text` \| `json` | Output format. |
+
+Without `language` or `from`, both adapters answer, so a name declared in both languages returns both. That's useful for code with a TSX editor side and a PHP render side under the same name. With `language` or `from`, declarations in the other language are listed under `also defined in`.
+
+### Name forms {#name-forms}
+
+| Form | Example | Finds |
+|---|---|---|
+| Plain name | `Button`, `formatPrice`, `get_template_part` | Functions, components, classes, interfaces, types, enums, constants, variables |
+| Member | `Cart.addItem`, `Cart#addItem`, `Cart::addItem`, `Cart->addItem` | A method, property or constant of a class (TypeScript accepts `.`, `#`, `::`; PHP accepts `::`, `->`) |
+| Qualified PHP name | `Vendor\Pkg\Client`, `\Vendor\Pkg\Client` | A namespaced class or function |
+| PHP template name | `notice` for `templates/notice.php` | A PHP file with no classes or functions, described by its file-level docblock and the keys it reads |
+
+PHP names are case-insensitive, as in PHP. A plain PHP name that matches no class, function, constant or template falls back to methods with that name, up to 10 matches. Use `Class::method` or `from` to narrow it.
+
+### Lookup order {#lookup-order}
+
+TypeScript and JavaScript:
+
+1. Top-level declarations in the project's files with that name.
+2. Names imported by project files (`import { Button } from "@acme/ui"`), resolved to the package's declaration.
+3. Only when nothing matched: installed dependencies (`dependencies`, `peerDependencies`, `devDependencies`) whose `.d.ts` files mention the name.
+
+With `from`, only that file or module is searched.
+
+PHP:
+
+1. The project's `.php` files, except files ignored by `.gitignore` and the vendor folder.
+2. Every path in Composer's autoload (`vendor/composer/installed.json`).
+3. Only when nothing matched: every `.php` file under the vendor folder that declares the name. This finds packages Composer doesn't autoload, such as `php-stubs/wordpress-stubs`. The answer notes "Found by scanning vendor/".
+
+Project declarations are listed before dependency declarations.
+
+### Reading the text output {#output}
+
+```
+## ImageDropUploader (component, typescript)
+import from: "@acme/ui"
+source: @acme/ui/src/ImageDropUploader.tsx (from dist/index.js.map)
+
+ImageDropUploader({ image, onSelect, inlineSVG }: ImageDropUploaderProps): JSX.Element
+params:
+  props: ImageDropUploaderProps
+      image?: string | number | ImageProps
+      onSelect?: (image: ImageProps) => void
+      inlineSVG?: boolean = false  // Render SVGs inline.
+      + 1 more from RefAttributes
+returns: JSX.Element
+
+types:
+  ImageProps { id: number | null; focalPoint?: FocalPoint }
+  FocalPoint
+      x: number  // Horizontal position, 0 to 1.
+      y: number  // Vertical position, 0 to 1.
+```
+
+- `at:` is the declaration's `file:line`, shown for the project's own code. Symbols from installed packages (`node_modules`, Composer `vendor/`) leave out `at:`, the `[declared in]` of their fields and the locations of their members, because the agent needs the import path or qualified name, not the package's files. JSON output (`location`, `declaredIn`, and `dependency: true`) keeps them.
+- `import from:` is the module the project already imports it from, so it's the path to use in an import. `source:` appears when docblocks and defaults came from somewhere else, such as a source map.
+- Each field line reads `name?: type = default  // doc  [declared in]`. A `?` means optional. `= …` is the default as source text. `[file:line]` appears when the field is declared in another file than the symbol.
+- Indented lines under a parameter are its fields: a component's props, an unnamed object type, a destructured parameter with defaults, or the keys of a PHP array described with hash notation or an inline `array{…}` shape. A field whose type has a name refers to it by that name.
+- `types:` defines each custom type the answer refers to, once, closest to the signature first (the types the parameters use, then the types those use). Generics are defined in their declared form (`Transform<T>`); each use shows its own arguments. An object type with no docs or defaults prints on one line, `Name { a: T; b?: U }`. With docs or defaults, each field gets its own line. An alias of a union, tuple, function type or PHP array shape prints as `Name = …`, and an interface that only extends another type prints as what it extends (`TemplateArray = readonly Template[]`). Types from `@types` packages come after the project's and packages' own types at the same distance.
+- `not listed (describe them for their fields): …` names the types left out: past `depth`, past the size budget (8,000 characters of `types:`, which only very large APIs reach), types with more than 60 props (`TransformRawSchema (113 props)`), and alias definitions too long to read. Call `describe` on one of them for its fields.
+- A fully resolved answer ends there. `resolution: partial` and its reasons appear when something didn't resolve, and `notes:` when something limits the answer (missing defaults, untyped JavaScript parameters, PHP usages matched by name). The engine and background details, such as the compiler in use, are in `format: "json"` (`resolution.engine`, `resolution.info`) and in `status`.
+- A named union type shows what it stands for: `classes?: ClassArg (string | string[] | Record<string, boolean>)`.
+- `(type not declared)` marks a PHP array key that the code reads but no docblock documents. Its default still shows.
+- Long inline object types are shortened to `{ … }` in the header when their fields are listed below.
+- `members:` lists a class's public methods, properties and constants with one-line summaries. PHP classes list their own members only; describe the parent class for inherited ones.
+- Kinds: `component`, `function`, `method`, `class`, `interface`, `type`, `enum`, `constant`, `variable`, `property`, `namespace`, `trait`, `case`, `template file`.
+
+### What it reads {#what-it-reads}
+
+TypeScript and JavaScript: everything the TypeScript compiler resolves, including JSDoc `@param {type}` tags in JavaScript files. Defaults come from destructuring and parameter initializers, also inside `forwardRef(...)` and `memo(...)`. A file whose default export has no name (`export default function (props) {}`) is found by its file name: `Widget` finds `Widget.tsx`.
+
+PHP: native types, PHPDoc, PHPStan and Psalm types (`array{…}` shapes, `list<>`, generics, callables, conditional types kept as written), `@phpstan-type` / `@psalm-type` aliases and `@phpstan-import-type … from Class` across classes, `@phpstan-param` / `@phpstan-return` overrides, WordPress-style hash notation for array parameters (`@param array $args { @type string $key Desc. }`), and "Default …" phrases in descriptions. Array-key defaults are also read from code: `$args['key'] ?? default`, `isset( $args['key'] ) ? $args['key'] : default`, and merges with a literal array via `array_merge`, `array_replace`, `array_replace_recursive`, `wp_parse_args` or `shortcode_atts`. When code and docblock disagree on a default, the code wins. Keys the code reads but the docblock doesn't list are added with the note "Read in the code but not documented."
+
+## `list_exports` {#list-exports}
+
+| arg | type | meaning |
+|---|---|---|
+| `target` | string | A module specifier (`@scope/pkg`, `./lib/api`), a file path relative to the root, or a PHP namespace containing a backslash (`Vendor\Pkg`, or `Vendor\` for a single-segment namespace). |
+| `language` | string | As for `describe`. |
+| `root`, `format` | | As for `describe`. |
+
+Each entry: name, kind, a short signature, the first line of its docblock, and its location. A TypeScript file that isn't a module (no imports or exports) lists its top-level declarations instead. A PHP `.php` path lists that file's declarations, and a namespace lists every indexed declaration in it and its sub-namespaces.
+
+## `find_usages` {#find-usages}
+
+| arg | type | meaning |
+|---|---|---|
+| `name` | string | As for `describe`. |
+| `from` | string | Narrow which symbol is meant, as for `describe`. |
+| `language` | string | As for `describe`. |
+| `limit` | integer 1-200 | Most usages to return. Default 10. The header shows `showing N of TOTAL`. |
+| `root`, `format` | | As for `describe`. |
+
+Each usage is a `file:line` plus the whole enclosing call, `new` expression, JSX element or statement, up to 12 lines. That shows which props or array keys real code passes.
+
+- TypeScript uses the compiler's references, so it finds exactly that symbol, including through renamed imports. Import and export lines are skipped. Only project files are searched.
+- PHP matches by name, skipping comments, strings, `use` lines and the declaration itself, so a different symbol with the same name can show up (the result says so). A template file is found through string mentions of its path, such as `get_template_part( 'parts/ThemeHeading' )`. Project files are searched first, and dependencies only when the project has no usages.
+
+## `status` {#status}
+
+Takes only `root` and `format`. Returns the root and where it came from, the include and exclude settings, and per language: the engine, the number of indexed files, and notes such as "Using tsconfig.json.", "No tsconfig.json or jsconfig.json…", a missing `node_modules` or `vendor/`, or the TypeScript fallback.
+
+## Root {#root}
+
+The root comes from the first of these that is set:
+
+1. the tool call's `root` argument
+2. `--root` (when the server was started with it)
+3. `SYMBOL_MCP_ROOT`
+4. the first workspace root the MCP client reports through `roots/list`, re-read when the client sends a roots-changed notification
+5. the nearest folder at or above the server's working directory that has `.git`, `package.json`, `composer.json`, `tsconfig.json` or `jsconfig.json`
+
+Pass `root` only to look at a different project for one call. The server keeps one index per root, so switching back and forth is cheap after the first call.
+
+`SYMBOL_MCP_INCLUDE` / `--include` add folders or files to index (comma- or newline-separated, relative to the root, may be outside it or ignored by `.gitignore`). `SYMBOL_MCP_EXCLUDE` / `--exclude` add ignore patterns in `.gitignore` syntax. A flag replaces its environment variable instead of adding to it.
+
+## When parts of the project are missing {#missing}
+
+| Missing | What happens | Where it's reported |
+|---|---|---|
+| TypeScript in the project | The bundled TypeScript 5.9 is used | `status`, and `(bundled)` in the JSON `resolution.engine` |
+| A project TypeScript without the classic compiler API (TypeScript 7's native port) | The bundled TypeScript is used | `status` and JSON `resolution.info`, naming the project's version |
+| TypeScript only in a parent folder (hoisted monorepo install) | That copy is used | `(found above the root, in <folder>)` in `status` and the JSON engine |
+| `tsconfig.json` / `jsconfig.json` | Default options: JavaScript allowed, JSX, bundler module resolution; every source file `.gitignore` allows | `status` and JSON `resolution.info` |
+| `node_modules` | Project declarations still resolve; imports from packages don't | `partial`, the unresolved imports, and "node_modules doesn't exist…" |
+| `vendor/` | Project PHP still resolves; types imported from Composer packages are named but not expanded | `partial` with "(Composer packages aren't installed)" when a type couldn't be expanded; "Run composer install…" in `status` |
+| PHP on the machine | Nothing changes; PHP files are parsed with a WebAssembly build of tree-sitter-php | |
+| Docblocks and defaults in a package's `.d.ts` | Read from the original source: the `.d.ts.map`, a shipped `src/` folder, or the `sourcesContent` of the package's JavaScript source maps | The `source:` line; without any of them, the note "Only the declaration file was available…" |
+
+## Freshness {#freshness}
+
+Project files are re-read when their modification time changes, and the file lists, `tsconfig.json` and Composer's `installed.json` are re-read at most every 2 seconds, so edits show up on the next call. PHP files from Composer packages are re-checked the same way. Files under `node_modules` and the package sources recovered from source maps are read once per server process, so restart the server after installing or updating npm packages.
+
+The first call on a project builds the index. On a theme with about 30 TypeScript files and 160 PHP files, a cold CLI call takes about 3 seconds; later MCP calls reuse the loaded program.
+
+## Recipes {#recipes}
+
+**"What props does this component take?"**
+```
+describe({ name: "Button" })
+```
+
+**"Which component should I use from this package?"**
+```
+list_exports({ target: "@acme/ui" })
+  → pick one
+describe({ name: "MediaPicker", from: "@acme/ui" })
+```
+
+**"What keys does this PHP function's `$args` array accept, and what are their defaults?"**
+```
+describe({ name: "Card::render" })
+```
+Keys typed with a `@phpstan-type` alias, imported or local, have the alias defined under `types:`.
+
+**"Show me how the project already calls it."**
+```
+find_usages({ name: "Button", limit: 3 })
+```
+
+**"The editor component and the PHP template share a name. I only want the PHP one."**
+```
+describe({ name: "ThemeHeading", language: "php" })
+```
+The TypeScript declaration is listed under `also defined in`.
+
+**"Is this a WordPress core function, and what does it take?"**
+```
+describe({ name: "get_template_part", language: "php" })
+```
+Works when a stubs package such as `php-stubs/wordpress-stubs` is installed.
+
+## Diagnosis {#diagnosis}
+
+**"No declaration named X was found."** Check `status` for the root first. Then try a member form (`Class::method`), a qualified PHP name, `from` with the module or file, or `list_exports` on the package to see what it actually exports. In TypeScript, a name that no project file imports is only found in dependencies whose `.d.ts` files mention it, so pass `from` for anything else.
+
+**`resolution: partial` with "Imports that didn't resolve".** The listed modules aren't installed or their path doesn't resolve with the project's `tsconfig.json`. Types that come from them show as `any`, so don't copy those types.
+
+**`status` says `(bundled)`.** The project has no usable TypeScript. Results can differ slightly from the project's own type-check if the project's compiler version is very different.
+
+**A TypeScript answer is stale after `npm install`.** Files under `node_modules` are read once per process (§ Freshness). Restart the server. Composer changes are picked up without a restart.
+
+**A PHP class is missing inherited methods.** Only a class's own members are listed. The note names the parent class to describe.
+
+**PHP usages include an unrelated symbol.** PHP usages match by name. Narrow with `from` or check each location.
+
+**The root is wrong.** `status` shows where it came from. Set `SYMBOL_MCP_ROOT` in the server's config, or pass `root` for one call.
+
+## Source pointers {#source}
+
+- `src/mcp.ts`: MCP tool schemas and descriptions, client roots handling.
+- `src/cli.ts`: CLI commands, flags and exit codes (0 found, 1 nothing matched, 2 error).
+- `src/config.ts`: root order, project-folder detection, `SYMBOL_MCP_*` parsing.
+- `src/workspace.ts`: picks adapters per query, merges results, builds `also defined in`.
+- `src/format.ts`: the text output.
+- `src/adapters/typescript.ts`: compiler loading and fallback, project setup, symbol lookup, prop flattening, source recovery from source maps.
+- `src/adapters/php.ts`: tree-sitter index, Composer autoload, the vendor scan, defaults read from code, PHPDoc alias resolution, usages.
+- `src/adapters/phpdoc.ts`: docblock, tag, hash-notation and type-expression parsing.
+- `test/`: CLI and MCP-client tests against `test/fixtures/` (plain JavaScript without tsconfig or `node_modules`, a fake TypeScript 7 install, PHP without `vendor/`, run with `php` removed from `PATH`).

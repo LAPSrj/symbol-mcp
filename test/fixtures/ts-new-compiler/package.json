@@ -1,0 +1,7 @@
+{
+  "name": "ts-new-compiler-fixture",
+  "private": true,
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}
