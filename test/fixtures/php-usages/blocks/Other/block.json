@@ -1,0 +1,4 @@
+{
+	"name": "shop/other",
+	"render": "file:./Notice.php"
+}

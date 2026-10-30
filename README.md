@@ -51,15 +51,8 @@ Tools:
 |---|---|
 | `describe` | Signature, parameters or props (expanded into fields), defaults, docblock, location. Takes `name`, and optionally `from`, `language`, `depth`, `root`, `format`. |
 | `list_exports` | Everything a module, package, file or PHP namespace provides, with short signatures. |
-| `find_usages` | Where the project calls or renders a symbol, with the whole call or JSX element. |
+| `find_usages` | Where the project calls or renders a symbol, with the whole call or JSX element and the function it's in. `depth` adds the callers of those functions, level by level, to show what a change affects. |
 | `status` | Root, engines in use, indexed file counts, and what's missing. |
-
-An answer that didn't fully resolve ends with `resolution: partial` and the
-reasons (an import that didn't resolve, packages that aren't installed, a
-type imported from a class that isn't indexed). A fully resolved answer has
-no resolution block. The engine and background details, such as which
-TypeScript was used, are in the `--json` / `format: "json"` output and in
-`status`.
 
 `llms-full.txt` is the manual for agents that call the tools: every argument,
 name forms, lookup order, how to read the output, recipes and diagnosis.
@@ -73,6 +66,7 @@ symbol-mcp describe Button --from @acme/ui
 symbol-mcp exports @acme/ui
 symbol-mcp exports "Vendor\Package"
 symbol-mcp usages formatPrice --limit 5
+symbol-mcp usages "Cart::render" --depth 3
 symbol-mcp status
 ```
 
@@ -114,41 +108,6 @@ Everything else comes from the project itself:
 | `vendor/` | Project PHP still resolves. Types imported from Composer packages are named but not expanded, and the answer says to run `composer install`. |
 | PHP on the machine | Nothing; PHP isn't used. |
 | Docblocks and defaults in a package's `.d.ts` | Read from the package's original source: the declaration map, a shipped `src/` folder, or the `sourcesContent` of its JavaScript source maps. |
-
-## What it reads
-
-TypeScript and JavaScript: everything the compiler resolves. Props of
-`Omit<…> & {…}` are flattened into one list. Props a type takes from the
-standard library or `@types` packages (DOM attributes, `key`, `ref`) are
-summarized under the type the code wrote, such as
-`+ 269 more from Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "onChange">`. Defaults come from destructuring (`{ size = "md" }`)
-and parameter initializers, including inside `forwardRef` and `memo`.
-
-Every custom type an answer refers to by name is defined once in a `types:`
-section at the end, closest to the signature first, with generics in their
-declared form (`Transform<T>`). The section stops at 8,000 characters and
-names the rest; only very large APIs reach that. TypeScript's standard
-library and React's own types (`@types/react`, `@types/react-dom`) aren't
-defined, since agents know them.
-
-PHP: native types, PHPDoc and PHPStan/Psalm types (`array{…}` shapes, `list<>`,
-generics, callables, `@phpstan-type` and `@phpstan-import-type` across
-classes), WordPress-style hash notation for array parameters
-(`@param array $args { @type string $key … }`), and "Default …" phrases.
-Defaults for array keys are also read from code:
-`$args['key'] ?? default`, `isset( $args['key'] ) ? … : default`, and merges
-with a literal defaults array (`array_merge`, `array_replace`, `wp_parse_args`,
-`shortcode_atts`). Files without classes or functions (templates) are
-described by their file-level docblock and the keys they read.
-
-## Tests
-
-```sh
-npm test
-```
-
-The tests run the CLI and an MCP client against the projects in
-`test/fixtures/`, including a run with `php` removed from `PATH`.
 
 ## License
 

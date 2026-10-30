@@ -14,7 +14,7 @@ const common = {
 		.string()
 		.optional()
 		.describe(
-			"Project root for this call. Usually leave it out: the server uses --root or SYMBOL_MCP_ROOT, then the client's workspace root, then the nearest project folder above its working directory.",
+			"Project root for this call. Usually leave it out; status shows the root in use.",
 		),
 	format: z.enum(["text", "json"]).optional().describe("text (default) is compact and readable; json returns the full structure."),
 };
@@ -22,7 +22,7 @@ const common = {
 const language = z
 	.string()
 	.optional()
-	.describe(`Only look in one language: ${LANGUAGES.join(", ")}. JavaScript and TypeScript share one adapter.`);
+	.describe(`Only look in one language: ${LANGUAGES.join(", ")}. The JavaScript and TypeScript names all select the same thing.`);
 
 function reply(text: string) {
 	return { content: [{ type: "text" as const, text }] };
@@ -73,7 +73,7 @@ export async function startServer(base: ConfigInput[]): Promise<void> {
 		{
 			title: "Describe a symbol",
 			description:
-				"Look up how to call a function, component, class, method, interface, type or constant, the way an editor's hover and autocomplete would. " +
+				"Look up how to call a function, component, class, method, interface, type or constant. " +
 				"Returns the signature, every parameter or prop with its resolved type, whether it's optional, its default value and its docblock, plus the file and line. " +
 				"Works for code in the project and in installed packages (node_modules, Composer vendor), and reads PHP template files that document the variables they receive. " +
 				"Use it before calling something you haven't used yet, instead of opening its source or .d.ts file.",
@@ -136,13 +136,23 @@ export async function startServer(base: ConfigInput[]): Promise<void> {
 		{
 			title: "Find usages",
 			description:
-				"Show where the project calls or renders a symbol, with the full call or JSX element at each place, so you can copy a working example. " +
+				"Show where the project calls or renders a symbol, with the full call or JSX element at each place and the function it's in, so you can copy a working example. " +
+				"With depth above 1, also lists who uses those functions, level by level, to show what a change to the symbol could affect. " +
 				"Project files come first; dependencies are searched only when the project has no usages.",
 			inputSchema: {
 				name: z.string().describe("Symbol name, as for describe."),
 				from: z.string().optional().describe("Narrow which symbol is meant, as for describe."),
 				language,
-				limit: z.number().int().min(1).max(200).optional().describe("Most usages to return (default 10)."),
+				limit: z.number().int().min(1).max(200).optional().describe("Most usages to return, and most callers listed per function in a caller tree (default 10)."),
+				depth: z
+					.number()
+					.int()
+					.min(1)
+					.max(10)
+					.optional()
+					.describe(
+						"Levels of callers (default 1: only the usages). 2 also lists where each function containing a usage is used, 3 where those are used. Levels below the first show the location and enclosing function, not the code.",
+					),
 				...common,
 			},
 		},
@@ -161,7 +171,7 @@ export async function startServer(base: ConfigInput[]): Promise<void> {
 		{
 			title: "Index status",
 			description:
-				"Show the project root, which engines are used (project or bundled TypeScript, the PHP parser), how many files are indexed, and what's missing, such as node_modules, vendor/ or a tsconfig.",
+				"Show the project root in use and what's missing, such as node_modules, vendor/ or a tsconfig. Check it first when an answer looks wrong.",
 			inputSchema: { ...common },
 		},
 		async (args) => {

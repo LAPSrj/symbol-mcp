@@ -1,4 +1,4 @@
-import type { DescribeResult, ExportsResult, Field, MemberSummary, Resolution, SymbolInfo, TypeEntry, UsagesResult } from "./model.js";
+import type { DescribeResult, ExportsResult, Field, MemberSummary, Resolution, SymbolInfo, TypeEntry, Usage, UsagesResult } from "./model.js";
 import { truncate } from "./text.js";
 
 const MAX_DOC = 1500;
@@ -158,12 +158,28 @@ export function formatExports(results: ExportsResult[], notes: string[]): string
 	return parts.join("\n\n");
 }
 
+/**
+ * A usage line is `file:line  in Name (kind)  [callback, unconfirmed]`,
+ * then the code, then each caller one level deeper as `← file:line  in …`.
+ */
+function usageLines(usage: Usage, indent: string, top: boolean): string[] {
+	let head = `${indent}${top ? "" : "← "}${usage.location}`;
+	if (usage.in) head += `  in ${usage.in.name} (${usage.in.kind})`;
+	const marks = [usage.callback && "callback", usage.unconfirmed && "unconfirmed"].filter(Boolean);
+	if (marks.length) head += `  [${marks.join(", ")}]`;
+	if (usage.repeated) head += "  (callers listed elsewhere)";
+	const lines = [head];
+	if (usage.text) lines.push(...usage.text.split("\n").map((l) => `${indent}  ${l}`));
+	for (const caller of usage.callers ?? []) lines.push(...usageLines(caller, `${indent}  `, false));
+	if (usage.moreCallers) lines.push(`${indent}  ← ${usage.moreCallers} more`);
+	else if (usage.callers && !usage.callers.length) lines.push(`${indent}  ← no usages found`);
+	return lines;
+}
+
 export function formatUsages(results: UsagesResult[], notes: string[]): string {
 	const parts = results.map((result) => {
 		const lines = [`## ${result.query} (${result.language}): showing ${result.usages.length} of ${result.total}`];
-		for (const usage of result.usages) {
-			lines.push("", `${usage.location}`, ...usage.text.split("\n").map((l) => `  ${l}`));
-		}
+		for (const usage of result.usages) lines.push("", ...usageLines(usage, "", true));
 		return withResolution(lines, result.resolution).join("\n");
 	});
 	if (notes.length) parts.push(["notes:", ...notes.map((n) => `  - ${n}`)].join("\n"));

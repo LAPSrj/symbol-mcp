@@ -117,8 +117,20 @@ export interface ExportsResult {
 
 export interface Usage {
 	location: string;
-	/** The call, JSX element or expression that uses the symbol, trimmed to a few lines. */
-	text: string;
+	/** The call, JSX element or expression that uses the symbol, trimmed to a few lines. Left out below the first level of a caller tree. */
+	text?: string;
+	/** The function, method, class or template file the usage is in. */
+	in?: { name: string; kind: string };
+	/** The symbol is passed by name (a PHP callable string or array) for other code to call later, so the callers of `in` aren't followed. */
+	callback?: boolean;
+	/** Only the name matched: the class of the object it's called on couldn't be worked out. Its callers aren't followed. */
+	unconfirmed?: boolean;
+	/** Usages of `in`, when `depth` is more than 1. */
+	callers?: Usage[];
+	/** Usages of `in` left out by `limit` or the size budget. */
+	moreCallers?: number;
+	/** `in` is the symbol itself, or its callers are listed under another usage. */
+	repeated?: boolean;
 }
 
 export interface UsagesResult {
@@ -145,10 +157,14 @@ export interface DescribeOptions {
 export interface UsagesOptions {
 	from?: string;
 	limit: number;
+	/** Levels of the caller tree: 1 lists the usages only, 2 also the usages of the functions they're in. */
+	depth: number;
 }
 
 export interface LanguageAdapter {
 	readonly language: string;
+	/** Re-read the file list and config and re-parse changed files. Called once at the start of every request. */
+	sync(): Promise<void>;
 	/** Whether this adapter should answer for a `from` value (file path or module specifier). */
 	accepts(from: string): boolean;
 	describe(name: string, options: DescribeOptions): Promise<SymbolInfo[]>;

@@ -84,7 +84,18 @@ export class Workspace {
 		}
 	}
 
-	private select(language: string | undefined, from: string | undefined, notes: string[]): LanguageAdapter[] {
+	/** Bring an adapter up to date with the files on disk. Returns false, with a note, when that fails. */
+	private async synced(adapter: LanguageAdapter, notes: string[]): Promise<boolean> {
+		try {
+			await adapter.sync();
+			return true;
+		} catch (error) {
+			notes.push(`${adapter.language}: ${message(error)}`);
+			return false;
+		}
+	}
+
+	private async select(language: string | undefined, from: string | undefined, notes: string[]): Promise<LanguageAdapter[]> {
 		const languages = language ? [language] : Object.keys(FACTORIES);
 		const out: LanguageAdapter[] = [];
 		for (const lang of languages) {
@@ -94,7 +105,7 @@ export class Workspace {
 				continue;
 			}
 			if (from && !adapter.accepts(from)) continue;
-			out.push(adapter);
+			if (await this.synced(adapter, notes)) out.push(adapter);
 		}
 		return out;
 	}
@@ -102,7 +113,7 @@ export class Workspace {
 	async describe(query: { name: string; from?: string; language?: string; depth?: number }): Promise<DescribeResult> {
 		const language = normalizeLanguage(query.language);
 		const notes: string[] = [];
-		const chosen = this.select(language, query.from, notes);
+		const chosen = await this.select(language, query.from, notes);
 		const depth = Math.max(0, Math.min(query.depth ?? MAX_DEPTH, MAX_DEPTH));
 		const results = await Promise.all(
 			chosen.map((adapter) =>
@@ -122,7 +133,7 @@ export class Workspace {
 		if (language || query.from) {
 			for (const lang of Object.keys(FACTORIES)) {
 				const adapter = this.adapter(lang);
-				if (!adapter || chosen.includes(adapter)) continue;
+				if (!adapter || chosen.includes(adapter) || !(await this.synced(adapter, []))) continue;
 				alsoDefinedIn.push(...(await adapter.declarations(query.name).catch(() => [])));
 			}
 		}
@@ -134,7 +145,7 @@ export class Workspace {
 		const language = normalizeLanguage(query.language);
 		const notes: string[] = [];
 		const results: ExportsResult[] = [];
-		for (const adapter of this.select(language, undefined, notes)) {
+		for (const adapter of await this.select(language, undefined, notes)) {
 			try {
 				const result = await adapter.exports(query.target);
 				if (result) results.push(result);
@@ -146,14 +157,15 @@ export class Workspace {
 		return { results, notes };
 	}
 
-	async usages(query: { name: string; from?: string; language?: string; limit?: number }): Promise<{ results: UsagesResult[]; notes: string[] }> {
+	async usages(query: { name: string; from?: string; language?: string; limit?: number; depth?: number }): Promise<{ results: UsagesResult[]; notes: string[] }> {
 		const language = normalizeLanguage(query.language);
 		const notes: string[] = [];
 		const limit = Math.max(1, Math.min(query.limit ?? 10, 200));
+		const depth = Math.max(1, Math.min(query.depth ?? 1, MAX_DEPTH));
 		const results: UsagesResult[] = [];
-		for (const adapter of this.select(language, query.from, notes)) {
+		for (const adapter of await this.select(language, query.from, notes)) {
 			try {
-				const result = await adapter.usages(query.name, { from: query.from, limit });
+				const result = await adapter.usages(query.name, { from: query.from, limit, depth });
 				if (result && (result.total > 0 || result.resolution.notes.length)) results.push(result);
 			} catch (error) {
 				notes.push(`${adapter.language}: ${message(error)}`);
@@ -167,7 +179,7 @@ export class Workspace {
 	async status(rootSource = this.config.rootSource): Promise<{ root: string; rootSource: string; include: string[]; exclude: string[]; adapters: AdapterStatus[]; notes: string[] }> {
 		const notes: string[] = [];
 		const adapters: AdapterStatus[] = [];
-		for (const adapter of this.select(undefined, undefined, notes)) {
+		for (const adapter of await this.select(undefined, undefined, notes)) {
 			try {
 				adapters.push(await adapter.status());
 			} catch (error) {

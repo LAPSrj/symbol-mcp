@@ -1,0 +1,5 @@
+{
+	"name": "shop/notice",
+	"title": "Notice",
+	"render": "file:./Notice.php"
+}

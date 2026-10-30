@@ -1,0 +1,4 @@
+notice:
+  template: blocks/Notice/Notice.php
+fallbacks:
+  - blocks/Notice/Notice.php

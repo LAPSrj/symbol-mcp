@@ -225,6 +225,75 @@ test("usages show the call with its arguments", () => {
 	assert.match(js.usages[0].text, /currency: "EUR"/);
 });
 
+const usagesOf = (name, root, extra = []) => run(["usages", name, "--root", fixture(root), ...extra]).json.results.flatMap((r) => r.usages);
+const byLocation = (usages) => Object.fromEntries(usages.map((u) => [u.location, u]));
+
+test("PHP usages: receiver classes, use aliases, traits and callbacks", () => {
+	const render = byLocation(usagesOf("Cart::render", "php-usages"));
+	assert.deepEqual(Object.keys(render).sort(), ["functions.php:7", "src/Cart.php:27", "src/Report.php:13", "src/Report.php:14"]);
+	assert.equal(render["src/Cart.php:27"].callback, true, "[ $this, 'render' ] is a callback");
+	assert.equal(render["src/Report.php:14"].unconfirmed, true, "$unknown has no type");
+	assert.equal(render["functions.php:7"].unconfirmed, undefined, "$cart = new Cart()");
+	assert.deepEqual(render["src/Report.php:13"].in, { name: "Report::build", kind: "method" });
+
+	const report = byLocation(usagesOf("Report::render", "php-usages"));
+	assert.deepEqual(Object.keys(report).sort(), ["src/Report.php:12", "src/Report.php:14"], "$cart->render() is Cart's");
+
+	assert.deepEqual(Object.keys(byLocation(usagesOf("Formatter::format", "php-usages"))), ["src/Cart.php:23"], "typed property through a use alias");
+	assert.deepEqual(Object.keys(byLocation(usagesOf("Totals::total", "php-usages"))), ["src/Cart.php:23"], "trait method through $this");
+	assert.deepEqual(Object.keys(byLocation(usagesOf("Cart", "php-usages"))).sort(), ["functions.php:6", "src/Report.php:10"], "$cart isn't the class");
+
+	const setup = byLocation(usagesOf("setup", "php-usages"));
+	assert.deepEqual(Object.keys(setup).sort(), ["functions.php:11", "functions.php:14", "functions.php:20"]);
+	assert.equal(setup["functions.php:14"].callback, true);
+	assert.equal(setup["functions.php:14"].unconfirmed, undefined, "add_action's $callback is declared callable");
+
+	const filter = usagesOf("Cart::filter", "php-usages");
+	assert.equal(filter.length, 1);
+	assert.equal(filter[0].callback, true, "[ self::class, 'filter' ] passed to an undeclared function");
+});
+
+test("JSON and YAML paths that resolve to a template file are usages of it", () => {
+	const notice = usagesOf("Notice", "php-usages");
+	assert.deepEqual(
+		notice.map((u) => `${u.location} ${u.text}`),
+		["blocks/Notice/block.json:4 \"render\": \"file:./Notice.php\"", "config/views.yml:2 template: blocks/Notice/Notice.php", "config/views.yml:4 - blocks/Notice/Notice.php"],
+		"blocks/Other/block.json points at blocks/Other/Notice.php, and .tooling/ is hidden",
+	);
+	const [inTemplate] = usagesOf("notice_classes", "php-usages", ["--depth", "2"]);
+	assert.deepEqual(inTemplate.in, { name: "blocks/Notice/Notice.php", kind: "template file" });
+	assert.deepEqual(inTemplate.callers.map((u) => u.location), ["blocks/Notice/block.json:4", "config/views.yml:2", "config/views.yml:4"]);
+});
+
+test("caller trees follow the functions usages are in", () => {
+	const [format] = usagesOf("Formatter::format", "php-usages", ["--depth", "3"]);
+	assert.deepEqual(format.in, { name: "Cart::render", kind: "method" });
+	const callers = byLocation(format.callers);
+	assert.equal(callers["functions.php:7"].text, undefined, "only the first level has code");
+	assert.deepEqual(callers["functions.php:7"].callers.map((u) => `${u.location} ${u.in?.name}`), ["functions.php:11 boot", "functions.php:14 undefined", "functions.php:20 undefined"]);
+	assert.equal(callers["src/Cart.php:27"].callers, undefined, "a callback's callers aren't followed");
+	assert.equal(callers["src/Report.php:14"].callers, undefined, "an unconfirmed usage's callers aren't followed");
+	assert.deepEqual(callers["src/Report.php:13"].callers, [], "nothing uses Report::build");
+
+	const ts = byLocation(usagesOf("formatPrice", "ts-callers", ["--depth", "5"]));
+	const chain = [];
+	for (let usage = ts["src/cart.ts:4"]; usage; usage = usage.callers?.[0]) chain.push(`${usage.location} ${usage.in?.name ?? "-"}`);
+	assert.deepEqual(chain, ["src/cart.ts:4 total", "src/checkout.ts:3 checkout", "src/checkout.ts:7 Page.render", "src/main.ts:3 -"]);
+	assert.equal(ts["src/price.ts:2"].repeated, true, "a recursive call doesn't expand the symbol again");
+	const badge = ts["src/Badge.ts:4"];
+	assert.deepEqual([badge.in.name, badge.callers[0].location, badge.callers[0].in.name], ["Badge", "src/labels.ts:3", "saleLabel"], "an anonymous default export is followed by its file name");
+
+	const text = spawnSync(process.execPath, [cli, "usages", "formatPrice", "--root", fixture("ts-callers"), "--depth", "3"], { encoding: "utf8" }).stdout;
+	assert.match(text, /^src\/cart\.ts:4 {2}in total \(function\)\n {2}formatPrice\(item\)\n {2}← src\/checkout\.ts:3 {2}in checkout \(function\)\n {4}← src\/checkout\.ts:7 {2}in Page\.render \(method\)$/m);
+});
+
+test("PHP array defaults come from any merge assigned back or returned, whatever its name", () => {
+	const configure = run(["describe", "configure", "--root", fixture("php-usages")]).json.matches[0];
+	assert.deepEqual(configure.signatures[0].params[0].fields.map((f) => `${f.name}=${f.default}`), ["size='lg'"], "a merge into another variable doesn't count");
+	const normalize = run(["describe", "normalize", "--root", fixture("php-usages")]).json.matches[0];
+	assert.deepEqual(normalize.signatures[0].params[0].fields.map((f) => `${f.name}=${f.default}`), ["label=''"]);
+});
+
 test("exports of a file and a namespace", () => {
 	const ts = run(["exports", "src/price.js", "--root", fixture("js-plain")]).json.results[0];
 	assert.deepEqual(ts.exports.map((e) => e.name).sort(), ["formatPrice", "untyped"]);

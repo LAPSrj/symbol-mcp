@@ -25,6 +25,7 @@ Options:
   --from <spec>        describe/usages: file path, module specifier or PHP namespace to narrow the lookup
   --language <lang>    typescript, javascript or php
   --depth <n>          describe: hops of custom types to define under types: (0-10, default all)
+                       usages: levels of callers to list (1-10, default 1)
   --limit <n>          usages: most results to show (default 10)
   --json               Print JSON instead of text
   -h, --help           Show this help
@@ -92,7 +93,13 @@ async function main(): Promise<number> {
 			return results.some((r) => r.exports.length) ? 0 : 1;
 		}
 		case "usages": {
-			const { results, notes } = await workspace.usages({ name: requireTarget(), from: values.from, language: values.language, limit: number(values.limit, "limit") });
+			const { results, notes } = await workspace.usages({
+				name: requireTarget(),
+				from: values.from,
+				language: values.language,
+				limit: number(values.limit, "limit"),
+				depth: number(values.depth, "depth"),
+			});
 			console.log(json ? JSON.stringify({ results, notes }, null, 2) : formatUsages(results, notes));
 			return results.some((r) => r.total > 0) ? 0 : 1;
 		}

@@ -1,0 +1,8 @@
+{
+  "name": "fixture/php-usages",
+  "autoload": {
+    "psr-4": {
+      "Shop\\": "src/"
+    }
+  }
+}

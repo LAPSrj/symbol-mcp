@@ -1,6 +1,7 @@
 // Talk to the server over stdio the way an MCP client does.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -84,5 +85,34 @@ test("MCP server lists its tools and answers describe, list_exports, find_usages
 		assert.equal(bad.isError, true);
 	} finally {
 		await client.close();
+	}
+});
+
+test("MCP server sees an edit or a new file made right after a query, in both languages", async () => {
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "symbol-mcp-edit-"));
+	fs.cpSync(path.join(here, "fixtures", "php-plain"), project, { recursive: true });
+	const jsFile = path.join(project, "price.js");
+	fs.writeFileSync(jsFile, "export function editedPrice(n = 1) { return n; }\n");
+	const transport = new StdioClientTransport({ command: process.execPath, args: [cli, "mcp"], env: { ...cleanEnv(), SYMBOL_MCP_ROOT: project } });
+	const client = new Client({ name: "test", version: "0.0.0" });
+	await client.connect(transport);
+	const describe = async (name) => (await client.callTool({ name: "describe", arguments: { name } })).content[0].text;
+	try {
+		const phpFile = path.join(project, "functions.php");
+		assert.match(await describe("fixture_button"), /'primary'/);
+		fs.writeFileSync(phpFile, fs.readFileSync(phpFile, "utf8").replace("'variant' => 'primary', 'size'", "'variant' => 'ghost', 'size'"));
+		assert.match(await describe("fixture_button"), /'ghost'/);
+
+		assert.match(await describe("editedPrice"), /n\?: number = 1/);
+		fs.writeFileSync(jsFile, "export function editedPrice(n = 7) { return n; }\n");
+		assert.match(await describe("editedPrice"), /n\?: number = 7/);
+
+		fs.writeFileSync(path.join(project, "added.php"), "<?php\nfunction added_now( int $count = 3 ): void {}\n");
+		fs.writeFileSync(path.join(project, "added.js"), "export const addedToo = (size = 2) => size;\n");
+		assert.match(await describe("added_now"), /\$count\?: int = 3/);
+		assert.match(await describe("addedToo"), /size\?: number = 2/);
+	} finally {
+		await client.close();
+		fs.rmSync(project, { recursive: true, force: true });
 	}
 });

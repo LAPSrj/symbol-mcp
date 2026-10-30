@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import type TS from "typescript";
+import { expandCallers, type UsageSite } from "../callers.js";
 import type { Config } from "../config.js";
 import { walk, relativeTo, readJson, mtimeOf } from "../files.js";
 import type {
@@ -59,9 +60,6 @@ class TypeContext {
 		this.keys.add(this.key(type));
 	}
 }
-/** How long a loaded tsconfig and file list stay fresh before they're re-read. */
-const SETUP_TTL_MS = 2000;
-
 interface LoadedCompiler {
 	ts: Ts;
 	engine: string;
@@ -245,8 +243,7 @@ export class TypeScriptAdapter implements LanguageAdapter {
 	private readonly ts: Ts;
 	private readonly engine: string;
 	private readonly compilerNotes: string[];
-	private setup!: ProjectSetup;
-	private setupAt = 0;
+	private setup: ProjectSetup;
 	private readonly extraRoots = new Set<string>();
 	private readonly service: TS.LanguageService;
 	private readonly originals = new Map<string, OriginalSource | null>();
@@ -257,7 +254,7 @@ export class TypeScriptAdapter implements LanguageAdapter {
 		this.ts = compiler.ts;
 		this.engine = compiler.engine;
 		this.compilerNotes = compiler.notes;
-		this.refresh(true);
+		this.setup = loadProject(this.ts, this.config);
 		this.service = this.ts.createLanguageService(this.host(), this.ts.createDocumentRegistry());
 	}
 
@@ -268,10 +265,9 @@ export class TypeScriptAdapter implements LanguageAdapter {
 
 	// ---------------------------------------------------------------- setup
 
-	private refresh(force = false): void {
-		if (!force && Date.now() - this.setupAt < SETUP_TTL_MS) return;
+	/** The file list and tsconfig. Edits to known files need nothing here: the host reports each file's modification time as its version. */
+	async sync(): Promise<void> {
 		this.setup = loadProject(this.ts, this.config);
-		this.setupAt = Date.now();
 	}
 
 	private host(): TS.LanguageServiceHost {
@@ -299,7 +295,6 @@ export class TypeScriptAdapter implements LanguageAdapter {
 	}
 
 	private program(): TS.Program {
-		this.refresh();
 		const program = this.service.getProgram();
 		if (!program) throw new Error("TypeScript couldn't build a program for this project.");
 		return program;
@@ -1423,6 +1418,92 @@ export class TypeScriptAdapter implements LanguageAdapter {
 		return { skip: false, node };
 	}
 
+	private isTopLevelVariable(decl: TS.VariableDeclaration): boolean {
+		const container = decl.parent?.parent?.parent;
+		return !!container && (this.ts.isSourceFile(container) || this.ts.isModuleBlock(container));
+	}
+
+	/** `const X = () => …`, or a call wrapping a function such as `forwardRef(…)` and `memo(…)`. */
+	private isFunctionValue(node: TS.Expression | undefined): boolean {
+		const ts = this.ts;
+		if (!node) return false;
+		if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) return true;
+		return ts.isCallExpression(node) && node.arguments.some((arg) => this.isFunctionValue(arg));
+	}
+
+	/** Name of the class, or of the variable holding the object literal, that a member belongs to. */
+	private ownerName(node: TS.Node): string | undefined {
+		const ts = this.ts;
+		if ((ts.isClassDeclaration(node) || ts.isClassExpression(node)) && node.name) return node.name.text;
+		if (ts.isObjectLiteralExpression(node) && ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) return node.parent.name.text;
+		return undefined;
+	}
+
+	/**
+	 * The named function, method, class or top-level variable a reference is
+	 * in, and the node to find its own references from. Anonymous functions
+	 * are looked through: a call inside `items.map(i => …)` counts for the
+	 * function around it.
+	 */
+	private callerOf(node: TS.Node): { name: string; kind: string; nameNode: TS.Node } | undefined {
+		const ts = this.ts;
+		for (let current = node.parent; current && !ts.isSourceFile(current); current = current.parent) {
+			if (ts.isFunctionDeclaration(current) || ts.isClassDeclaration(current)) {
+				const kind = ts.isClassDeclaration(current) ? "class" : "function";
+				if (current.name) return { name: current.name.text, kind, nameNode: current.name };
+				const keyword = current.modifiers?.find((m) => m.kind === ts.SyntaxKind.DefaultKeyword);
+				if (keyword) return { name: path.basename(current.getSourceFile().fileName).replace(/\.[cm]?[jt]sx?$/, ""), kind, nameNode: keyword };
+				continue;
+			}
+			if (ts.isConstructorDeclaration(current)) {
+				const owner = current.parent;
+				if (ts.isClassLike(owner) && owner.name) return { name: `${owner.name.text}.constructor`, kind: "constructor", nameNode: owner.name };
+				continue;
+			}
+			if (ts.isMethodDeclaration(current) || ts.isGetAccessorDeclaration(current) || ts.isSetAccessorDeclaration(current) || ts.isPropertyDeclaration(current)) {
+				const memberName = current.name;
+				if (!ts.isIdentifier(memberName) && !ts.isPrivateIdentifier(memberName) && !ts.isStringLiteral(memberName)) continue;
+				const owner = this.ownerName(current.parent);
+				return { name: owner ? `${owner}.${memberName.text}` : memberName.text, kind: ts.isPropertyDeclaration(current) ? "property" : "method", nameNode: memberName };
+			}
+			if (ts.isVariableDeclaration(current) && ts.isIdentifier(current.name) && this.isTopLevelVariable(current)) {
+				return { name: current.name.text, kind: this.isFunctionValue(current.initializer) ? "function" : "variable", nameNode: current.name };
+			}
+		}
+		return undefined;
+	}
+
+	/** Usages of the declaration whose name is at `pos` in `file`, in project files. */
+	private sitesAt(program: TS.Program, file: string, pos: number): UsageSite<{ file: string; pos: number }>[] {
+		const seen = new Set<string>();
+		const sites: UsageSite<{ file: string; pos: number }>[] = [];
+		for (const group of this.service.findReferences(file, pos) ?? []) {
+			for (const ref of group.references) {
+				if (ref.isDefinition || !this.isProjectFile(ref.fileName)) continue;
+				const sf = program.getSourceFile(ref.fileName);
+				if (!sf) continue;
+				const node = this.nodeAt(sf, ref.textSpan.start);
+				if (!node) continue;
+				const context = this.usageContext(sf, node);
+				if (context.skip) continue;
+				const { line } = sf.getLineAndCharacterOfPosition(ref.textSpan.start);
+				const location = `${relativeTo(this.config.root, sf.fileName)}:${line + 1}`;
+				if (seen.has(location)) continue;
+				seen.add(location);
+				const usage: Usage = { location, text: trimBlock(context.node.getText(sf)) };
+				const caller = this.callerOf(node);
+				if (!caller) {
+					sites.push({ usage });
+					continue;
+				}
+				usage.in = { name: caller.name, kind: caller.kind };
+				const handle = { file: sf.fileName, pos: caller.nameNode.getStart(sf) };
+				sites.push({ usage, caller: { key: `${handle.file}:${handle.pos}`, handle } });
+			}
+		}
+		return sites.sort((a, b) => a.usage.location.localeCompare(b.usage.location, undefined, { numeric: true }));
+	}
+
 	async usages(name: string, options: UsagesOptions): Promise<UsagesResult | null> {
 		if (options.from && !this.accepts(options.from)) return null;
 		const notes: string[] = [];
@@ -1430,37 +1511,26 @@ export class TypeScriptAdapter implements LanguageAdapter {
 		const resolution: Resolution = { engine: this.engine, status: notes.length ? "partial" : "full", notes, info: [...this.compilerNotes] };
 		if (!found.length) return { query: name, language: "typescript", total: 0, usages: [], resolution };
 
-		const seen = new Set<string>();
-		const usages: Usage[] = [];
+		const expanded = new Set<string>();
+		const byLocation = new Map<string, UsageSite<{ file: string; pos: number }>>();
 		for (const item of found) {
 			const symbol = item.symbol.flags & this.ts.SymbolFlags.Alias ? program.getTypeChecker().getAliasedSymbol(item.symbol) : item.symbol;
 			const decl = symbol.valueDeclaration ?? symbol.declarations?.[0];
 			if (!decl) continue;
 			const nameNode = this.ts.getNameOfDeclaration(decl as TS.Declaration) ?? decl;
-			const refs = this.service.findReferences(decl.getSourceFile().fileName, nameNode.getStart()) ?? [];
-			for (const group of refs) {
-				for (const ref of group.references) {
-					if (ref.isDefinition || !this.isProjectFile(ref.fileName)) continue;
-					const sf = program.getSourceFile(ref.fileName);
-					if (!sf) continue;
-					const node = this.nodeAt(sf, ref.textSpan.start);
-					if (!node) continue;
-					const context = this.usageContext(sf, node);
-					if (context.skip) continue;
-					const { line } = sf.getLineAndCharacterOfPosition(ref.textSpan.start);
-					const location = `${relativeTo(this.config.root, sf.fileName)}:${line + 1}`;
-					if (seen.has(location)) continue;
-					seen.add(location);
-					usages.push({ location, text: trimBlock(context.node.getText(sf)) });
-				}
+			const file = decl.getSourceFile().fileName;
+			expanded.add(`${file}:${nameNode.getStart()}`);
+			for (const site of this.sitesAt(program, file, nameNode.getStart())) {
+				if (!byLocation.has(site.usage.location)) byLocation.set(site.usage.location, site);
 			}
 		}
-		usages.sort((a, b) => a.location.localeCompare(b.location, undefined, { numeric: true }));
-		return { query: name, language: "typescript", total: usages.length, usages: usages.slice(0, options.limit), resolution };
+		const sites = [...byLocation.values()].sort((a, b) => a.usage.location.localeCompare(b.usage.location, undefined, { numeric: true }));
+		const top = sites.slice(0, options.limit);
+		expandCallers(top, options.depth, options.limit, (handle) => this.sitesAt(program, handle.file, handle.pos), expanded);
+		return { query: name, language: "typescript", total: sites.length, usages: top.map((site) => site.usage), resolution };
 	}
 
 	async status(): Promise<AdapterStatus> {
-		this.refresh(true);
 		return {
 			language: "typescript",
 			engine: this.engine,
